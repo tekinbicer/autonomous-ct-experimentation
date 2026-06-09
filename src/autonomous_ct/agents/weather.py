@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from ..graph import build_graph
 from ..tools import WEATHER_TOOLS
@@ -28,6 +29,7 @@ WEATHER_SYSTEM_PROMPT = (
 def build_weather_graph(
     llm: BaseChatModel | None = None,
     extra_tools: Sequence[Callable[..., Any]] | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> Any:
     """Compile the legacy weather demo agent graph.
 
@@ -37,6 +39,14 @@ def build_weather_graph(
         Optional pre-built chat model. Defaults to the project-configured Argo LLM.
     extra_tools:
         Additional tools to expose alongside the default weather tool set.
+    checkpointer:
+        Optional LangGraph checkpointer; see
+        :func:`autonomous_ct.graph.build_graph`.
     """
     tools = list(WEATHER_TOOLS) + list(extra_tools or [])
-    return build_graph(llm=llm, tools=tools, system_prompt=WEATHER_SYSTEM_PROMPT)
+    return build_graph(
+        llm=llm,
+        tools=tools,
+        system_prompt=WEATHER_SYSTEM_PROMPT,
+        checkpointer=checkpointer,
+    )

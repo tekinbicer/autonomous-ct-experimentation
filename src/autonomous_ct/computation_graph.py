@@ -19,6 +19,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from .agents.base import Agent
 from .graph import build_graph
@@ -27,6 +28,7 @@ from .graph import build_graph
 def build_computation_graph(
     agents: Sequence[Agent],
     llm: BaseChatModel | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
 ) -> Any:
     """Compile a computation graph composed of one or more agents.
 
@@ -38,6 +40,11 @@ def build_computation_graph(
         an inter-agent routing layer will be added (not yet implemented).
     llm:
         Optional shared chat model. Defaults to the project-configured Argo LLM.
+    checkpointer:
+        Optional LangGraph checkpointer. When provided, the compiled app
+        persists per-thread message state and supports resume across
+        invocations. See :func:`autonomous_ct.graph.build_graph` for the
+        ``thread_id`` config convention.
     """
     if not agents:
         raise ValueError("build_computation_graph requires at least one agent")
@@ -48,6 +55,7 @@ def build_computation_graph(
             llm=llm,
             tools=list(agent.tools),
             system_prompt=agent.system_prompt,
+            checkpointer=checkpointer,
         )
 
     raise NotImplementedError(

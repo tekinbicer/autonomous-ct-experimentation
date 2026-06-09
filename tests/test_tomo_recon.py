@@ -21,6 +21,7 @@ from autonomous_ct.tools.tomo_recon import (
     default_image,
     inspect_hdf5_dataset,
     plan_tomocupy_command,
+    read_hdf5_values,
     tomocupy_dry_run,
     tomocupy_reconstruct,
 )
@@ -476,3 +477,214 @@ def test_inspect_hdf5_truncates_at_max_entries(tmp_path: Path) -> None:
             h5.create_dataset(f"d{i:02d}", shape=(2,), dtype="int8")
     result = inspect_hdf5_dataset.invoke({"input_file": str(path), "max_entries": 5})
     assert "truncated at 5 entries" in result
+
+
+def test_read_hdf5_values_reports_not_found(tmp_path: Path) -> None:
+    result = read_hdf5_values.invoke(
+        {"input_file": str(tmp_path / "nope.h5"), "paths": ["/x"]}
+    )
+    assert result.startswith("NOT_FOUND:")
+
+
+def test_read_hdf5_values_rejects_empty_paths(fake_dataset: Path) -> None:
+    result = read_hdf5_values.invoke({"input_file": str(fake_dataset), "paths": []})
+    assert result.startswith("VALIDATION_ERROR:")
+    assert "non-empty list" in result
+
+
+def test_read_hdf5_values_rejects_too_many_paths(fake_dataset: Path) -> None:
+    paths = [f"/d{i}" for i in range(65)]
+    result = read_hdf5_values.invoke({"input_file": str(fake_dataset), "paths": paths})
+    assert result.startswith("VALIDATION_ERROR:")
+    assert "too many paths" in result
+
+
+def test_read_hdf5_values_rejects_nonpositive_max_inline(fake_dataset: Path) -> None:
+    result = read_hdf5_values.invoke(
+        {"input_file": str(fake_dataset), "paths": ["/x"], "max_inline_elements": 0}
+    )
+    assert result.startswith("VALIDATION_ERROR:")
+    assert "max_inline_elements" in result
+
+
+def test_read_hdf5_values_handles_missing_h5py(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "scan.h5"
+    fake.write_bytes(b"\x89HDF\r\n\x1a\n")
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name: str, *args: object, **kwargs: object) -> object:
+        if name == "h5py":
+            raise ImportError("h5py not available in this test")
+        return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    result = read_hdf5_values.invoke({"input_file": str(fake), "paths": ["/x"]})
+    assert result.startswith("H5PY_NOT_INSTALLED:")
+
+
+def test_read_hdf5_values_scalar(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "scalar.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset("rotation_axis", data=782.5)
+        h5.create_dataset("n_proj", data=1500)
+    result = read_hdf5_values.invoke(
+        {"input_file": str(path), "paths": ["/rotation_axis", "/n_proj"]}
+    )
+    assert "/rotation_axis = 782.5" in result
+    assert "/n_proj = 1500" in result
+
+
+def test_read_hdf5_values_short_1d_inlined(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    np = pytest.importorskip("numpy")
+    path = tmp_path / "theta.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset(
+            "exchange/theta", data=np.linspace(0.0, 180.0, 5, dtype="float32")
+        )
+    result = read_hdf5_values.invoke(
+        {"input_file": str(path), "paths": ["/exchange/theta"]}
+    )
+    assert "/exchange/theta = " in result
+    assert "shape=(5,)" in result
+    assert "data=[" in result
+    assert "180.0" in result
+
+
+def test_read_hdf5_values_long_1d_summarized(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    np = pytest.importorskip("numpy")
+    path = tmp_path / "long.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset(
+            "exchange/theta", data=np.arange(2000, dtype="float32")
+        )
+    result = read_hdf5_values.invoke(
+        {
+            "input_file": str(path),
+            "paths": ["/exchange/theta"],
+            "max_inline_elements": 256,
+        }
+    )
+    assert "/exchange/theta = " in result
+    assert "shape=(2000,)" in result
+    assert "first4=" in result and "last4=" in result
+    assert "min=0" in result
+    assert "data=[" not in result
+
+
+def test_read_hdf5_values_skips_minmax_on_huge_arrays(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    np = pytest.importorskip("numpy")
+    path = tmp_path / "huge.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset("exchange/theta", data=np.arange(20, dtype="float32"))
+    result = read_hdf5_values.invoke(
+        {
+            "input_file": str(path),
+            "paths": ["/exchange/theta"],
+            "max_inline_elements": 1,
+        }
+    )
+    assert "/exchange/theta = " in result
+    assert "shape=(20,)" in result
+    assert "first" in result and "last" in result
+    assert "min=" not in result and "max=" not in result
+
+
+def test_read_hdf5_values_multidim_summary_only(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "stack.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset("exchange/data", shape=(180, 64, 64), dtype="uint16")
+    result = read_hdf5_values.invoke(
+        {"input_file": str(path), "paths": ["/exchange/data"]}
+    )
+    assert "/exchange/data = " in result
+    assert "shape=(180, 64, 64)" in result
+    assert "multi-dimensional" in result
+    assert "data=[" not in result
+
+
+def test_read_hdf5_values_reads_attribute(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "attrs.h5"
+    with h5py.File(path, "w") as h5:
+        grp = h5.create_group("measurement/instrument/monochromator")
+        grp.attrs["units"] = "keV"
+        h5.attrs["version"] = "1.2.3"
+    result = read_hdf5_values.invoke(
+        {
+            "input_file": str(path),
+            "paths": [
+                "/measurement/instrument/monochromator@units",
+                "@version",
+            ],
+        }
+    )
+    assert "'keV'" in result
+    assert "'1.2.3'" in result
+
+
+def test_read_hdf5_values_missing_path(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "x.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset("present", data=1)
+    result = read_hdf5_values.invoke(
+        {"input_file": str(path), "paths": ["/absent", "/present"]}
+    )
+    assert "/absent -> MISSING:" in result
+    assert "/present = 1" in result
+
+
+def test_read_hdf5_values_missing_attribute(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "x.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_group("g")
+    result = read_hdf5_values.invoke(
+        {"input_file": str(path), "paths": ["/g@nope"]}
+    )
+    assert "/g@nope -> ATTR_MISSING:" in result
+
+
+def test_read_hdf5_values_group_without_attr_marker(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "x.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_group("only_a_group")
+    result = read_hdf5_values.invoke(
+        {"input_file": str(path), "paths": ["/only_a_group"]}
+    )
+    assert "/only_a_group -> NOT_A_DATASET:" in result
+
+
+def test_read_hdf5_values_empty_attr_name_is_validation_error(
+    tmp_path: Path,
+) -> None:
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "x.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_group("g")
+    result = read_hdf5_values.invoke(
+        {"input_file": str(path), "paths": ["/g@"]}
+    )
+    assert "/g@ -> VALIDATION_ERROR:" in result
+    assert "empty attribute name" in result
+
+
+def test_read_hdf5_values_decodes_bytes_dataset(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    path = tmp_path / "bytes.h5"
+    with h5py.File(path, "w") as h5:
+        h5.create_dataset("label", data=b"sample_42")
+    result = read_hdf5_values.invoke(
+        {"input_file": str(path), "paths": ["/label"]}
+    )
+    assert "/label = 'sample_42'" in result

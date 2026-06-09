@@ -33,6 +33,25 @@ Tools you can call:
     dtypes) to reason about projection counts and chunk sizes. Prefer
     calling this first when the user has not specified rotation_axis or
     nsino_per_chunk.
+  - read_hdf5_values(input_file, paths=[...]): read the actual values of
+    scalars, small 1-D arrays, and HDF5 attributes at named paths. Use
+    this AFTER `inspect_hdf5_dataset` to pull out reconstruction-relevant
+    parameters before planning the run. Use the `@attr` suffix to read an
+    HDF5 attribute (e.g. `"/measurement/instrument/monochromator@units"`).
+    Common DXchange / APS paths worth checking when present:
+      * `/exchange/theta` -- projection angle array (1-D); confirms angular
+        coverage and step. Inferred theta length should match the first
+        axis of `/exchange/data`.
+      * `/measurement/instrument/detector_motor_stack/setup/pixel_size`
+        -- detector pixel size, useful for physical-units output.
+      * `/measurement/instrument/detection_system/objective/camera_objective`
+      * `/measurement/instrument/monochromator/energy` -- beam energy.
+      * `/measurement/instrument/sample_motor_stack/setup/sample_in_position`
+      * `/process/acquisition/rotation/rotation_axis` -- when present,
+        a previously-recorded rotation axis; still verify with a `try`
+        run before committing to a `full` reconstruction.
+    For large arrays the tool returns shape/dtype/preview only (it will
+    not flood the conversation with pixel data).
   - tomocupy_dry_run(...): assemble the exact `docker run` command WITHOUT
     executing it. Use this to confirm parameters with the user, especially
     for long-running `full` or `lamino_full` reconstructions.

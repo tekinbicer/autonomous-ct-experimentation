@@ -8,8 +8,7 @@ dependencies = [
     "h5py>=3.16.0",
     "langchain-openai>=1.2.1",
     "langgraph>=1.2.0",
-    "scipy>=1.17.1",
-    "tiffile>=2018.10.18",
+    "langgraph-checkpoint-sqlite>=2.0.0",
 ]
 
 [project.optional-dependencies]

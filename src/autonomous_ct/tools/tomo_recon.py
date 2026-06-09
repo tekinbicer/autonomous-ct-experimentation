@@ -28,6 +28,7 @@ symlink to a deep beamline path that Docker may not be allowed to mount.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shlex
 import subprocess
@@ -651,6 +652,247 @@ def inspect_hdf5_dataset(input_file: str, max_entries: int = 40) -> str:
                 h5.visititems(visitor)
             except _StopVisit:
                 lines.append(f"  ... (truncated at {max_entries} entries)")
+    except OSError as exc:
+        return f"H5_READ_ERROR: {exc}"
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# HDF5 value reader
+# ---------------------------------------------------------------------------
+
+# Cap on paths per call; guards against runaway tool calls flooding context.
+_MAX_HDF5_PATHS: int = 64
+
+# Max 1-D length to inline in full; longer arrays fall back to a head/tail
+# preview. Sized so a typical tomography theta array (180-360 angles) inlines
+# whole, while multi-thousand-element arrays do not.
+_DEFAULT_MAX_INLINE_ELEMENTS: int = 256
+
+_PREVIEW_HEAD_TAIL: int = 4
+
+_NUMERIC_DTYPE_KINDS: frozenset[str] = frozenset({"i", "u", "f"})
+
+
+def _parse_h5_path(spec: str) -> tuple[str, str | None]:
+    """Split a path spec into ``(hdf5_path, attribute_or_None)``.
+
+    The ``@attr`` suffix selects an HDF5 attribute on the object at
+    ``hdf5_path`` instead of the object's value. ``"/group@version"``,
+    ``"/group/dataset@units"``, and ``"@root_attr"`` are all supported.
+    The first ``@`` wins; subsequent ``@`` characters are part of the
+    attribute name.
+    """
+    if "@" in spec:
+        h5_path, attr = spec.split("@", 1)
+        attr = attr.strip()
+        if not attr:
+            raise ValueError(
+                f"path spec {spec!r} has empty attribute name after '@'."
+            )
+        return (h5_path or "/", attr)
+    return (spec, None)
+
+
+def _format_scalar(value: object) -> str:
+    if isinstance(value, bytes):
+        try:
+            return repr(value.decode("utf-8"))
+        except UnicodeDecodeError:
+            return repr(value)
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return repr(item())
+        except (ValueError, TypeError):
+            pass
+    return repr(value)
+
+
+def _format_array_value(value: object, max_inline: int) -> str:
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    if shape is None or shape == ():
+        return _format_scalar(value)
+
+    ndim = len(shape)
+    if ndim == 1:
+        length = shape[0]
+        if length <= max_inline:
+            tolist = getattr(value, "tolist", None)
+            data = tolist() if callable(tolist) else list(value)  # type: ignore[arg-type]
+            return f"shape={shape} dtype={dtype} data={data!r}"
+        head_n = min(_PREVIEW_HEAD_TAIL, length)
+        tail_n = min(_PREVIEW_HEAD_TAIL, length)
+        try:
+            head = list(value[:head_n])  # type: ignore[index]
+            tail = list(value[-tail_n:])  # type: ignore[index]
+        except (TypeError, IndexError):
+            head, tail = [], []
+        summary = (
+            f"shape={shape} dtype={dtype} "
+            f"first{head_n}={head!r} last{tail_n}={tail!r}"
+        )
+        if getattr(dtype, "kind", None) in _NUMERIC_DTYPE_KINDS:
+            with contextlib.suppress(ValueError, TypeError):
+                summary += f" min={value.min()} max={value.max()}"  # type: ignore[union-attr]
+        return summary
+
+    return f"shape={shape} dtype={dtype} (multi-dimensional; not inlined)"
+
+
+_MIN_MAX_MAX_LENGTH_RATIO: int = 10
+
+
+def _render_dataset(dataset: object, max_inline: int) -> str:
+    shape = dataset.shape  # type: ignore[attr-defined]
+    dtype = dataset.dtype  # type: ignore[attr-defined]
+
+    if shape == ():
+        return _format_scalar(dataset[()])  # type: ignore[index]
+
+    if len(shape) == 1 and shape[0] <= max_inline:
+        return _format_array_value(dataset[()], max_inline)  # type: ignore[index]
+
+    if len(shape) == 1:
+        length = shape[0]
+        head_n = min(_PREVIEW_HEAD_TAIL, length)
+        tail_n = min(_PREVIEW_HEAD_TAIL, length)
+        head = list(dataset[:head_n])  # type: ignore[index]
+        tail = list(dataset[-tail_n:]) if tail_n else []  # type: ignore[index]
+        rendered = (
+            f"shape={shape} dtype={dtype} "
+            f"first{head_n}={head!r} last{tail_n}={tail!r}"
+        )
+        is_numeric = getattr(dtype, "kind", None) in _NUMERIC_DTYPE_KINDS
+        within_minmax_budget = length <= _MIN_MAX_MAX_LENGTH_RATIO * max_inline
+        if is_numeric and within_minmax_budget:
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                arr = dataset[()]  # type: ignore[index]
+                rendered += f" min={arr.min()} max={arr.max()}"
+        return rendered
+
+    return f"shape={shape} dtype={dtype} (multi-dimensional; not inlined)"
+
+
+@tool
+def read_hdf5_values(
+    input_file: str,
+    paths: list[str],
+    max_inline_elements: int = _DEFAULT_MAX_INLINE_ELEMENTS,
+) -> str:
+    """Read scalar values, small 1-D arrays, and attributes from an HDF5 file.
+
+    Use this AFTER ``inspect_hdf5_dataset`` has revealed the file's
+    structure, to pull out reconstruction-relevant parameters such as the
+    rotation axis, theta array, detector pixel size, exposure time, energy,
+    etc.
+
+    Path syntax
+    -----------
+    Each entry in ``paths`` is either:
+
+      * ``"/group/dataset"`` -- reads the dataset value
+      * ``"/group@attr"``    -- reads the named HDF5 attribute on the group
+      * ``"/group/dataset@attr"`` -- reads an attribute on a dataset
+      * ``"@attr"`` or ``"/@attr"`` -- reads a file-root attribute
+
+    Value handling
+    --------------
+      * Scalar (0-D) values are returned inline as Python literals.
+      * 1-D arrays with at most ``max_inline_elements`` (default
+        ``256``) entries are returned inline as a list.
+      * Longer 1-D arrays are summarized: shape, dtype, head/tail
+        preview, plus numeric ``min``/``max`` when applicable.
+      * Arrays with more than one dimension are summarized as
+        ``shape=... dtype=...`` only (no element data is returned).
+      * ``bytes`` are decoded as UTF-8 when possible, otherwise repr'd.
+
+    Reconstruction-relevant paths (DXchange / APS tomography convention)
+    --------------------------------------------------------------------
+      * ``/exchange/theta``                  -- projection angles (1-D)
+      * ``/exchange/data`` (shape only via   -- projections array
+        ``inspect_hdf5_dataset``)              (returned as shape/dtype)
+      * ``/measurement/instrument/detector_motor_stack/setup/pixel_size``
+      * ``/measurement/instrument/detection_system/objective/camera_objective``
+      * ``/measurement/instrument/monochromator/energy``
+      * ``/measurement/instrument/sample_motor_stack/setup/sample_in_position``
+      * ``/process/acquisition/rotation/rotation_axis``  -- when present
+
+    Returns
+    -------
+    A multi-line string. Each requested path becomes one line of the form
+    ``"/path = <value-or-summary>"``. Missing paths/attributes return
+    explicit error markers (``MISSING:``, ``ATTR_MISSING:``,
+    ``UNREADABLE:``) so the agent can react without crashing the run.
+    """
+    if not isinstance(paths, list) or not paths:
+        return "VALIDATION_ERROR: `paths` must be a non-empty list of HDF5 path strings."
+    if len(paths) > _MAX_HDF5_PATHS:
+        return (
+            f"VALIDATION_ERROR: too many paths requested ({len(paths)} > "
+            f"{_MAX_HDF5_PATHS}). Split the request into smaller batches."
+        )
+    if max_inline_elements <= 0:
+        return (
+            "VALIDATION_ERROR: `max_inline_elements` must be a positive integer; "
+            f"got {max_inline_elements}."
+        )
+
+    host_file = Path(input_file).expanduser().absolute()
+    if not host_file.is_file():
+        return f"NOT_FOUND: {host_file}"
+
+    try:
+        import h5py  # type: ignore[import-not-found]
+    except ImportError:
+        return (
+            "H5PY_NOT_INSTALLED: install with `uv add h5py` (or skip and rely on "
+            "the user-provided metadata)."
+        )
+
+    lines: list[str] = [f"HDF5 values for {host_file}"]
+    try:
+        with h5py.File(host_file, "r") as h5:
+            for spec in paths:
+                try:
+                    h5_path, attr = _parse_h5_path(spec)
+                except ValueError as exc:
+                    lines.append(f"  {spec} -> VALIDATION_ERROR: {exc}")
+                    continue
+
+                obj_path = h5_path if h5_path else "/"
+                if obj_path not in h5:
+                    lines.append(f"  {spec} -> MISSING: no object at {obj_path!r}")
+                    continue
+                obj = h5[obj_path]
+
+                try:
+                    if attr is not None:
+                        if attr not in obj.attrs:
+                            lines.append(
+                                f"  {spec} -> ATTR_MISSING: no attribute "
+                                f"{attr!r} on {obj_path!r}"
+                            )
+                            continue
+                        rendered = _format_array_value(
+                            obj.attrs[attr], max_inline_elements
+                        )
+                        lines.append(f"  {spec} = {rendered}")
+                        continue
+
+                    if not isinstance(obj, h5py.Dataset):
+                        lines.append(
+                            f"  {spec} -> NOT_A_DATASET: {obj_path!r} is a "
+                            "group; request a dataset path or use '@attr'."
+                        )
+                        continue
+
+                    rendered = _render_dataset(obj, max_inline_elements)
+                    lines.append(f"  {spec} = {rendered}")
+                except (OSError, ValueError, TypeError) as exc:
+                    lines.append(f"  {spec} -> UNREADABLE: {exc}")
     except OSError as exc:
         return f"H5_READ_ERROR: {exc}"
 

@@ -27,6 +27,7 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .coverage
+.*.sqlite
 htmlcov/
 
 # Secrets / local config
