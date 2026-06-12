@@ -1,18 +1,18 @@
 """Tomocupy-backed tomographic / laminographic reconstruction tools.
 
 These tools shell out to a containerized ``tomocupy`` build (default image
-``tomocupy:1.1.0-cu124``) using the documented invocation:
+``tomocupy:latest``) using the documented invocation:
 
     docker run --rm --gpus all \\
-      -v "${INPUT_FOLDER}:/data" \\
-      -v "${OUTPUT_FOLDER}:/data_rec" \\
+      -v "${INPUT_FOLDER}:/input" \\
+      -v "${OUTPUT_FOLDER}:/output" \\
       tomocupy:<tag> \\
       recon \\
-        --file-name /data/<input-file> \\
+        --file-name /input/<input-file> \\
         --reconstruction-type <full|try|lamino|...> \\
-        --rotation-axis <float> \\
+        --rotation-axis-auto auto \\
         --nsino-per-chunk <int> \\
-        --out-path-name /data_rec/<output-prefix>
+        --out-path-name /output/<output-prefix>
 
 The Python wrappers below validate parameters, translate host paths to
 container paths, and (optionally) execute the command. They are exposed as
@@ -22,7 +22,7 @@ Path semantics
 --------------
 Host paths are made absolute via ``Path.absolute()`` but symlinks are NOT
 resolved. The user-named directory is what gets bind-mounted into the
-container; this avoids surprising the user when ``/data/scan.h5`` is a
+container; this avoids surprising the user when ``/input/scan.h5`` is a
 symlink to a deep beamline path that Docker may not be allowed to mount.
 """
 
@@ -45,10 +45,10 @@ from pydantic import BaseModel, Field
 # module is imported (e.g. via ``Settings.from_env`` → ``python-dotenv``) are
 # still honored.
 # ---------------------------------------------------------------------------
-_FALLBACK_IMAGE = "tomocupy:1.1.0-cu124"
+_FALLBACK_IMAGE = "tomocupy:latest"
 _FALLBACK_DOCKER_BIN = "docker"
-CONTAINER_INPUT_MOUNT = "/data"
-CONTAINER_OUTPUT_MOUNT = "/data_rec"
+CONTAINER_INPUT_MOUNT = "/input"
+CONTAINER_OUTPUT_MOUNT = "/output"
 
 # Subset of host env passed to the docker subprocess. Anything outside this set
 # is dropped to keep runs reproducible and avoid leaking secrets.
@@ -170,7 +170,7 @@ class TomocupyInvocation:
     host_input_dir / host_output_dir:
         Absolute host directories that will be bind-mounted into the container.
     container_input_path / container_output_prefix:
-        The paths the container itself will see (``/data/...`` / ``/data_rec/...``).
+        The paths the container itself will see (``/input/...`` / ``/output/...``).
     """
 
     command: list[str]
@@ -223,7 +223,7 @@ def _resolve_input(input_file: str | os.PathLike[str]) -> tuple[Path, Path, str]
     because ``Path.is_file()`` follows symlinks by default.
 
     Returns ``(host_dir, host_file, container_path)`` where ``host_dir`` is the
-    directory bind-mounted into the container at ``/data``.
+    directory bind-mounted into the container at ``/input``.
     """
     host_file = Path(input_file).expanduser().absolute()
     if not host_file.is_file():
@@ -323,7 +323,7 @@ def plan_tomocupy_command(
     if host_output_dir == host_input_dir:
         raise ValueError(
             "output_dir must be a different host directory than the input file's "
-            "parent; tomocupy expects distinct /data and /data_rec mounts."
+            "parent; tomocupy expects distinct /input and /output mounts."
         )
 
     resolved_image = image or default_image()
@@ -394,12 +394,12 @@ class TomocupyToolParams(BaseModel):
     """Parameters shared by ``tomocupy_reconstruct`` and ``tomocupy_dry_run``."""
 
     input_file: str = Field(
-        ..., description="Absolute host path to the HDF5 dataset (e.g. /data/scan.h5)."
+        ..., description="Absolute host path to the HDF5 dataset (e.g. /input/scan.h5)."
     )
     output_dir: str = Field(
         ...,
         description=(
-            "Absolute host directory for outputs. Bind-mounted to /data_rec in "
+            "Absolute host directory for outputs. Bind-mounted to /output in "
             "the container; created if missing."
         ),
     )
@@ -407,7 +407,7 @@ class TomocupyToolParams(BaseModel):
         ...,
         description=(
             "Basename (no path separators, no '..') used for the output. "
-            "Container receives /data_rec/<output_prefix> as --out-path-name."
+            "Container receives /output/<output_prefix> as --out-path-name."
         ),
     )
     reconstruction_type: ReconstructionType = Field(

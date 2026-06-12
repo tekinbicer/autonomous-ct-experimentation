@@ -2,7 +2,7 @@
 
 A LangGraph-based autonomous agent for Computed Tomography (CT)
 experimentation. The default agent is a **computational imaging assistant**
-that drives a containerized [`tomocupy`](https://github.com/nikitinvv/tomocupy)
+that drives a containerized [`tomocupy`](https://github.com/tomography/tomocupy)
 reconstruction backend (GPU/CUDA) to perform 3D tomographic and
 laminographic reconstructions. A legacy weather demo agent is retained for
 end-to-end smoke testing.
@@ -13,7 +13,7 @@ end-to-end smoke testing.
 - [`uv`](https://docs.astral.sh/uv/) for dependency management
 - Access to the Argo LLM gateway (ANL-internal)
 - For real reconstructions: Docker with NVIDIA Container Toolkit and a
-  built `tomocupy` image (default tag: `tomocupy:1.1.0-cu124`)
+  built `tomocupy` image (default tag: `tomocupy:latest`)
 
 ## Setup
 
@@ -164,15 +164,15 @@ Equivalent manual invocation (what the tool builds for you):
 docker run --rm --gpus all \
   --user "$(id -u):$(id -g)" \
   -e HOME=/tmp \
-  -v "${INPUT_FOLDER}:/data" \
-  -v "${OUTPUT_FOLDER}:/data_rec" \
-  tomocupy:1.1.0-cu124 \
+  -v "${INPUT_FOLDER}:/input" \
+  -v "${OUTPUT_FOLDER}:/output" \
+  tomocupy:latest \
   recon \
-    --file-name /data/${INPUT_FILE_NAME} \
+    --file-name /input/${INPUT_FILE_NAME} \
     --reconstruction-type ${RECON_TYPE} \
     --rotation-axis ${ROTATION_AXIS} \
     --nsino-per-chunk ${NSIN_PER_CHUNK} \
-    --out-path-name /data_rec/${OUTPUT_PREFIX}
+    --out-path-name /output/${OUTPUT_PREFIX}
 ```
 
 ## Project layout
@@ -219,5 +219,5 @@ All runtime configuration is sourced from environment variables (see
 | `ARGO_HOST_HEADER`      | no       | Optional explicit `Host` header override                   |
 | `ARGO_TIMEOUT_SECONDS`  | no       | HTTP timeout for Argo calls (default `60`)                 |
 | `ARGO_MAX_RETRIES`      | no       | Retry budget for Argo calls (default `2`)                  |
-| `TOMOCUPY_IMAGE`        | no       | Docker image tag (default `tomocupy:1.1.0-cu124`)          |
+| `TOMOCUPY_IMAGE`        | no       | Docker image tag (default `tomocupy:latest`)               |
 | `TOMOCUPY_DOCKER_BIN`   | no       | Docker CLI binary (default `docker`)                       |
