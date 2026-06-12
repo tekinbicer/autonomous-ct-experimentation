@@ -41,18 +41,6 @@ uv run autonomous-ct "Plan a full reconstruction of /data/scan_001.h5 \
   nsino-per-chunk 4. Show me the command before running."
 ```
 
-Select a different agent with `--agent`:
-
-```bash
-uv run autonomous-ct --agent weather "What is the weather like in Tokyo?"
-```
-
-Or run the original three-scenario weather demo:
-
-```bash
-uv run python scripts/demo.py
-```
-
 ### Interactive (multi-turn) mode
 
 Use `--conversation` (`-c`) to start a continuous session in which the agent
