@@ -17,8 +17,10 @@ from autonomous_ct.tools import tomo_recon as tr
 from autonomous_ct.tools.tomo_recon import (
     CONTAINER_INPUT_MOUNT,
     CONTAINER_OUTPUT_MOUNT,
+    default_backend,
     default_docker_bin,
     default_image,
+    default_tomocupy_bin,
     inspect_hdf5_dataset,
     plan_tomocupy_command,
     read_hdf5_values,
@@ -173,9 +175,7 @@ def test_plan_requires_axis_for_full(fake_dataset: Path, out_dir: Path) -> None:
 
 
 @pytest.mark.parametrize("rtype", ["lamino", "lamino_full"])
-def test_plan_requires_axis_for_lamino_modes(
-    fake_dataset: Path, out_dir: Path, rtype: str
-) -> None:
+def test_plan_requires_axis_for_lamino_modes(fake_dataset: Path, out_dir: Path, rtype: str) -> None:
     with pytest.raises(ValueError, match="requires rotation_axis"):
         plan_tomocupy_command(
             input_file=fake_dataset,
@@ -186,9 +186,7 @@ def test_plan_requires_axis_for_lamino_modes(
         )
 
 
-def test_plan_rejects_extra_args_overriding_canonical(
-    fake_dataset: Path, out_dir: Path
-) -> None:
+def test_plan_rejects_extra_args_overriding_canonical(fake_dataset: Path, out_dir: Path) -> None:
     with pytest.raises(ValueError, match="canonical recon flag"):
         plan_tomocupy_command(
             input_file=fake_dataset,
@@ -227,7 +225,7 @@ def test_plan_rejects_docker_level_extra_args(
 
 
 def test_plan_rejects_input_output_dir_collision(fake_dataset: Path) -> None:
-    with pytest.raises(ValueError, match="distinct /data and /data_rec"):
+    with pytest.raises(ValueError, match="distinct /input and /output mounts"):
         plan_tomocupy_command(
             input_file=fake_dataset,
             output_dir=fake_dataset.parent,
@@ -259,9 +257,7 @@ def test_plan_preserves_symlinked_input_dir_for_mount(tmp_path: Path) -> None:
     assert f"{real_dir.absolute()}:{CONTAINER_INPUT_MOUNT}" not in plan.command
 
 
-def test_plan_omits_user_when_run_as_current_user_false(
-    fake_dataset: Path, out_dir: Path
-) -> None:
+def test_plan_omits_user_when_run_as_current_user_false(fake_dataset: Path, out_dir: Path) -> None:
     plan = plan_tomocupy_command(
         input_file=fake_dataset,
         output_dir=out_dir,
@@ -285,9 +281,7 @@ def test_plan_uses_explicit_container_user(fake_dataset: Path, out_dir: Path) ->
     assert plan.command[i + 1] == "1234:5678"
 
 
-def test_plan_merges_container_env_with_defaults(
-    fake_dataset: Path, out_dir: Path
-) -> None:
+def test_plan_merges_container_env_with_defaults(fake_dataset: Path, out_dir: Path) -> None:
     plan = plan_tomocupy_command(
         input_file=fake_dataset,
         output_dir=out_dir,
@@ -297,9 +291,7 @@ def test_plan_merges_container_env_with_defaults(
     )
 
     def has_env_pair(cmd: list[str], kv: str) -> bool:
-        return any(
-            cmd[i] == "-e" and cmd[i + 1] == kv for i in range(len(cmd) - 1)
-        )
+        return any(cmd[i] == "-e" and cmd[i + 1] == kv for i in range(len(cmd) - 1))
 
     assert has_env_pair(plan.command, "FOO=bar")
     assert has_env_pair(plan.command, "HOME=/workspace")
@@ -480,9 +472,7 @@ def test_inspect_hdf5_truncates_at_max_entries(tmp_path: Path) -> None:
 
 
 def test_read_hdf5_values_reports_not_found(tmp_path: Path) -> None:
-    result = read_hdf5_values.invoke(
-        {"input_file": str(tmp_path / "nope.h5"), "paths": ["/x"]}
-    )
+    result = read_hdf5_values.invoke({"input_file": str(tmp_path / "nope.h5"), "paths": ["/x"]})
     assert result.startswith("NOT_FOUND:")
 
 
@@ -544,12 +534,8 @@ def test_read_hdf5_values_short_1d_inlined(tmp_path: Path) -> None:
     np = pytest.importorskip("numpy")
     path = tmp_path / "theta.h5"
     with h5py.File(path, "w") as h5:
-        h5.create_dataset(
-            "exchange/theta", data=np.linspace(0.0, 180.0, 5, dtype="float32")
-        )
-    result = read_hdf5_values.invoke(
-        {"input_file": str(path), "paths": ["/exchange/theta"]}
-    )
+        h5.create_dataset("exchange/theta", data=np.linspace(0.0, 180.0, 5, dtype="float32"))
+    result = read_hdf5_values.invoke({"input_file": str(path), "paths": ["/exchange/theta"]})
     assert "/exchange/theta = " in result
     assert "shape=(5,)" in result
     assert "data=[" in result
@@ -561,9 +547,7 @@ def test_read_hdf5_values_long_1d_summarized(tmp_path: Path) -> None:
     np = pytest.importorskip("numpy")
     path = tmp_path / "long.h5"
     with h5py.File(path, "w") as h5:
-        h5.create_dataset(
-            "exchange/theta", data=np.arange(2000, dtype="float32")
-        )
+        h5.create_dataset("exchange/theta", data=np.arange(2000, dtype="float32"))
     result = read_hdf5_values.invoke(
         {
             "input_file": str(path),
@@ -602,9 +586,7 @@ def test_read_hdf5_values_multidim_summary_only(tmp_path: Path) -> None:
     path = tmp_path / "stack.h5"
     with h5py.File(path, "w") as h5:
         h5.create_dataset("exchange/data", shape=(180, 64, 64), dtype="uint16")
-    result = read_hdf5_values.invoke(
-        {"input_file": str(path), "paths": ["/exchange/data"]}
-    )
+    result = read_hdf5_values.invoke({"input_file": str(path), "paths": ["/exchange/data"]})
     assert "/exchange/data = " in result
     assert "shape=(180, 64, 64)" in result
     assert "multi-dimensional" in result
@@ -636,9 +618,7 @@ def test_read_hdf5_values_missing_path(tmp_path: Path) -> None:
     path = tmp_path / "x.h5"
     with h5py.File(path, "w") as h5:
         h5.create_dataset("present", data=1)
-    result = read_hdf5_values.invoke(
-        {"input_file": str(path), "paths": ["/absent", "/present"]}
-    )
+    result = read_hdf5_values.invoke({"input_file": str(path), "paths": ["/absent", "/present"]})
     assert "/absent -> MISSING:" in result
     assert "/present = 1" in result
 
@@ -648,9 +628,7 @@ def test_read_hdf5_values_missing_attribute(tmp_path: Path) -> None:
     path = tmp_path / "x.h5"
     with h5py.File(path, "w") as h5:
         h5.create_group("g")
-    result = read_hdf5_values.invoke(
-        {"input_file": str(path), "paths": ["/g@nope"]}
-    )
+    result = read_hdf5_values.invoke({"input_file": str(path), "paths": ["/g@nope"]})
     assert "/g@nope -> ATTR_MISSING:" in result
 
 
@@ -659,9 +637,7 @@ def test_read_hdf5_values_group_without_attr_marker(tmp_path: Path) -> None:
     path = tmp_path / "x.h5"
     with h5py.File(path, "w") as h5:
         h5.create_group("only_a_group")
-    result = read_hdf5_values.invoke(
-        {"input_file": str(path), "paths": ["/only_a_group"]}
-    )
+    result = read_hdf5_values.invoke({"input_file": str(path), "paths": ["/only_a_group"]})
     assert "/only_a_group -> NOT_A_DATASET:" in result
 
 
@@ -672,9 +648,7 @@ def test_read_hdf5_values_empty_attr_name_is_validation_error(
     path = tmp_path / "x.h5"
     with h5py.File(path, "w") as h5:
         h5.create_group("g")
-    result = read_hdf5_values.invoke(
-        {"input_file": str(path), "paths": ["/g@"]}
-    )
+    result = read_hdf5_values.invoke({"input_file": str(path), "paths": ["/g@"]})
     assert "/g@ -> VALIDATION_ERROR:" in result
     assert "empty attribute name" in result
 
@@ -684,7 +658,342 @@ def test_read_hdf5_values_decodes_bytes_dataset(tmp_path: Path) -> None:
     path = tmp_path / "bytes.h5"
     with h5py.File(path, "w") as h5:
         h5.create_dataset("label", data=b"sample_42")
-    result = read_hdf5_values.invoke(
-        {"input_file": str(path), "paths": ["/label"]}
-    )
+    result = read_hdf5_values.invoke({"input_file": str(path), "paths": ["/label"]})
     assert "/label = 'sample_42'" in result
+
+
+# ---------------------------------------------------------------------------
+# Native backend planner
+# ---------------------------------------------------------------------------
+
+
+def test_default_backend_defaults_to_docker(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TOMOCUPY_BACKEND", raising=False)
+    assert default_backend() == "docker"
+
+
+def test_default_backend_honors_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TOMOCUPY_BACKEND", "NATIVE")
+    assert default_backend() == "native"
+
+
+def test_default_backend_invalid_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TOMOCUPY_BACKEND", "podman")
+    with pytest.raises(ValueError, match="TOMOCUPY_BACKEND"):
+        default_backend()
+
+
+def test_default_tomocupy_bin_defaults_and_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TOMOCUPY_BIN", raising=False)
+    assert default_tomocupy_bin() == "tomocupy"
+    monkeypatch.setenv("TOMOCUPY_BIN", "/opt/conda/envs/tc/bin/tomocupy")
+    assert default_tomocupy_bin() == "/opt/conda/envs/tc/bin/tomocupy"
+
+
+def test_plan_native_builds_documented_command(fake_dataset: Path, out_dir: Path) -> None:
+    plan = plan_tomocupy_command(
+        input_file=fake_dataset,
+        output_dir=out_dir,
+        output_prefix="my_rec",
+        reconstruction_type="full",
+        rotation_axis=782.5,
+        nsino_per_chunk=4,
+        backend="native",
+    )
+
+    assert plan.backend == "native"
+    expected = [
+        "tomocupy",
+        "recon",
+        "--file-name",
+        str(fake_dataset.absolute()),
+        "--reconstruction-type",
+        "full",
+        "--nsino-per-chunk",
+        "4",
+        "--out-path-name",
+        str(out_dir.absolute() / "my_rec"),
+        "--rotation-axis",
+        "782.5",
+    ]
+    assert plan.command == expected
+    # No docker-level flags should leak into the native argv.
+    for forbidden in ("run", "--rm", "--gpus", "-v", "--user", "-e", "docker"):
+        assert forbidden not in plan.command
+    # The host output dir is still materialized so tomocupy can write into it.
+    assert out_dir.is_dir()
+    # Renamed invocation fields hold host paths in native mode.
+    assert plan.input_path == str(fake_dataset.absolute())
+    assert plan.output_prefix_path == str(out_dir.absolute() / "my_rec")
+
+
+def test_plan_native_uses_tomocupy_bin_param(fake_dataset: Path, out_dir: Path) -> None:
+    plan = plan_tomocupy_command(
+        input_file=fake_dataset,
+        output_dir=out_dir,
+        output_prefix="rec",
+        rotation_axis=1.0,
+        backend="native",
+        tomocupy_bin="/opt/conda/envs/tc/bin/tomocupy",
+    )
+    assert plan.command[0] == "/opt/conda/envs/tc/bin/tomocupy"
+
+
+def test_plan_native_honors_tomocupy_bin_env(
+    fake_dataset: Path, out_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOMOCUPY_BIN", "/usr/local/bin/tomocupy")
+    plan = plan_tomocupy_command(
+        input_file=fake_dataset,
+        output_dir=out_dir,
+        output_prefix="rec",
+        rotation_axis=1.0,
+        backend="native",
+    )
+    assert plan.command[0] == "/usr/local/bin/tomocupy"
+
+
+def test_plan_native_picks_up_env_backend_by_default(
+    fake_dataset: Path, out_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOMOCUPY_BACKEND", "native")
+    plan = plan_tomocupy_command(
+        input_file=fake_dataset,
+        output_dir=out_dir,
+        output_prefix="rec",
+        rotation_axis=1.0,
+    )
+    assert plan.backend == "native"
+    assert plan.command[0] == "tomocupy"
+
+
+def test_plan_rejects_unknown_backend_param(fake_dataset: Path, out_dir: Path) -> None:
+    with pytest.raises(ValueError, match="backend="):
+        plan_tomocupy_command(
+            input_file=fake_dataset,
+            output_dir=out_dir,
+            output_prefix="rec",
+            rotation_axis=1.0,
+            backend="podman",  # type: ignore[arg-type]
+        )
+
+
+def test_plan_native_requires_axis_for_full(fake_dataset: Path, out_dir: Path) -> None:
+    with pytest.raises(ValueError, match="requires rotation_axis"):
+        plan_tomocupy_command(
+            input_file=fake_dataset,
+            output_dir=out_dir,
+            output_prefix="rec",
+            reconstruction_type="full",
+            rotation_axis=None,
+            backend="native",
+        )
+
+
+def test_plan_native_omits_rotation_axis_for_try(fake_dataset: Path, out_dir: Path) -> None:
+    plan = plan_tomocupy_command(
+        input_file=fake_dataset,
+        output_dir=out_dir,
+        output_prefix="rec",
+        reconstruction_type="try",
+        rotation_axis=None,
+        backend="native",
+    )
+    assert "--rotation-axis" not in plan.command
+
+
+def test_plan_native_rejects_canonical_flag_extras(fake_dataset: Path, out_dir: Path) -> None:
+    with pytest.raises(ValueError, match="canonical recon flag"):
+        plan_tomocupy_command(
+            input_file=fake_dataset,
+            output_dir=out_dir,
+            output_prefix="rec",
+            rotation_axis=1.0,
+            backend="native",
+            extra_args=["--rotation-axis", "999"],
+        )
+
+
+@pytest.mark.parametrize(
+    "extras",
+    [
+        ["-v", "/etc:/etc"],
+        ["--gpus", "none"],
+        ["--user", "0"],
+        ["-e", "FOO=bar"],
+    ],
+)
+def test_plan_native_allows_docker_flags_in_extras(
+    fake_dataset: Path, out_dir: Path, extras: list[str]
+) -> None:
+    # In native mode the docker-flag rejection is dropped: these are nonsense
+    # for `tomocupy recon` but it isn't this tool's job to police every
+    # possible tomocupy flag.
+    plan = plan_tomocupy_command(
+        input_file=fake_dataset,
+        output_dir=out_dir,
+        output_prefix="rec",
+        rotation_axis=1.0,
+        backend="native",
+        extra_args=extras,
+    )
+    for arg in extras:
+        assert arg in plan.command
+
+
+def test_plan_native_allows_same_input_output_dir(fake_dataset: Path) -> None:
+    # Docker-only collision check is dropped in native mode (no bind mounts).
+    plan = plan_tomocupy_command(
+        input_file=fake_dataset,
+        output_dir=fake_dataset.parent,
+        output_prefix="rec",
+        rotation_axis=1.0,
+        backend="native",
+    )
+    assert plan.host_input_dir == plan.host_output_dir
+    assert plan.output_prefix_path == str(fake_dataset.parent.absolute() / "rec")
+
+
+def test_plan_native_lamino_with_extra_args(fake_dataset: Path, out_dir: Path) -> None:
+    plan = plan_tomocupy_command(
+        input_file=fake_dataset,
+        output_dir=out_dir,
+        output_prefix="lamino_rec",
+        reconstruction_type="lamino_full",
+        rotation_axis=512.0,
+        backend="native",
+        extra_args=["--lamino-angle", "18.5"],
+    )
+    assert "--lamino-angle" in plan.command and "18.5" in plan.command
+    assert plan.command.index("--lamino-angle") > plan.command.index("--out-path-name")
+
+
+def test_plan_native_ignores_docker_only_params(fake_dataset: Path, out_dir: Path) -> None:
+    plan = plan_tomocupy_command(
+        input_file=fake_dataset,
+        output_dir=out_dir,
+        output_prefix="rec",
+        rotation_axis=1.0,
+        backend="native",
+        # Every one of these is docker-only and must be silently ignored:
+        image="tomocupy:other",
+        use_gpus=False,
+        run_as_current_user=False,
+        container_user="1234:5678",
+        container_env={"FOO": "bar"},
+    )
+    # The argv must contain none of the docker-only effects.
+    assert "tomocupy:other" not in plan.command
+    assert "--gpus" not in plan.command
+    assert "--user" not in plan.command
+    assert "1234:5678" not in plan.command
+    assert "-e" not in plan.command
+    assert "FOO=bar" not in plan.command
+
+
+# ---------------------------------------------------------------------------
+# Native backend @tool wrappers + subprocess env
+# ---------------------------------------------------------------------------
+
+
+def test_dry_run_tool_native_mode(
+    fake_dataset: Path, out_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOMOCUPY_BACKEND", "native")
+    out_dir.mkdir()
+    result = tomocupy_dry_run.invoke(
+        {
+            "input_file": str(fake_dataset),
+            "output_dir": str(out_dir),
+            "output_prefix": "my_rec",
+            "reconstruction_type": "full",
+            "rotation_axis": 782.5,
+            "nsino_per_chunk": 4,
+        }
+    )
+    assert "DRY_RUN [backend=native]" in result
+    assert "docker run" not in result
+    assert "tomocupy recon" in result
+    assert str(fake_dataset.absolute()) in result
+    assert str(out_dir.absolute() / "my_rec") in result
+
+
+def test_reconstruct_tool_native_invokes_tomocupy_bin(
+    fake_dataset: Path, out_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOMOCUPY_BACKEND", "native")
+    monkeypatch.setenv("TOMOCUPY_BIN", "/opt/conda/envs/tc/bin/tomocupy")
+    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="recon ok\n", stderr="")
+    with patch("autonomous_ct.tools.tomo_recon.subprocess.run", return_value=completed) as mock_run:
+        result = tomocupy_reconstruct.invoke(
+            {
+                "input_file": str(fake_dataset),
+                "output_dir": str(out_dir),
+                "output_prefix": "my_rec",
+                "reconstruction_type": "full",
+                "rotation_axis": 782.5,
+                "nsino_per_chunk": 4,
+                "timeout_seconds": 5,
+            }
+        )
+
+    assert "SUCCESS [backend=native]" in result
+    mock_run.assert_called_once()
+    argv = mock_run.call_args.args[0]
+    assert argv[0] == "/opt/conda/envs/tc/bin/tomocupy"
+    assert argv[1] == "recon"
+    assert "docker" not in argv and "--gpus" not in argv and "-v" not in argv
+
+
+def test_reconstruct_tool_native_reports_tomocupy_missing(
+    fake_dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOMOCUPY_BACKEND", "native")
+    with patch(
+        "autonomous_ct.tools.tomo_recon.subprocess.run",
+        side_effect=FileNotFoundError("tomocupy"),
+    ):
+        result = tomocupy_reconstruct.invoke(
+            {
+                "input_file": str(fake_dataset),
+                "output_dir": str(tmp_path / "out"),
+                "output_prefix": "rec",
+                "rotation_axis": 100.0,
+            }
+        )
+    assert result.startswith("TOMOCUPY_BIN_NOT_FOUND:")
+    assert "TOMOCUPY_BIN" in result
+    assert "TOMOCUPY_BACKEND=docker" in result
+
+
+def test_reconstruct_tool_native_uses_cuda_aware_env(
+    fake_dataset: Path, out_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TOMOCUPY_BACKEND", "native")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1")
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/cuda/lib64")
+    monkeypatch.setenv("CONDA_PREFIX", "/opt/conda/envs/tc")
+    # A secret-looking var must NOT pass through the allowlist:
+    monkeypatch.setenv("ARGO_API_KEY", "super-secret-token")
+
+    completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    with patch("autonomous_ct.tools.tomo_recon.subprocess.run", return_value=completed) as mock_run:
+        tomocupy_reconstruct.invoke(
+            {
+                "input_file": str(fake_dataset),
+                "output_dir": str(out_dir),
+                "output_prefix": "rec",
+                "rotation_axis": 1.0,
+                "timeout_seconds": 5,
+            }
+        )
+
+    passed_env = mock_run.call_args.kwargs["env"]
+    assert passed_env.get("CUDA_VISIBLE_DEVICES") == "0,1"
+    assert passed_env.get("LD_LIBRARY_PATH") == "/opt/cuda/lib64"
+    assert passed_env.get("CONDA_PREFIX") == "/opt/conda/envs/tc"
+    assert "ARGO_API_KEY" not in passed_env
+    # All passed keys must be drawn from the native allowlist.
+    assert set(passed_env.keys()).issubset(set(tr._NATIVE_SUBPROCESS_ENV_ALLOWLIST))

@@ -6,6 +6,7 @@ from .tomo_recon import (
     read_hdf5_values,
     tomocupy_dry_run,
     tomocupy_reconstruct,
+    view_reconstruction_slice,
 )
 from .weather import get_weather
 
@@ -16,6 +17,7 @@ IMAGING_TOOLS = [
     tomocupy_dry_run,
     inspect_hdf5_dataset,
     read_hdf5_values,
+    view_reconstruction_slice,
 ]
 
 __all__ = [
@@ -27,4 +29,5 @@ __all__ = [
     "read_hdf5_values",
     "tomocupy_dry_run",
     "tomocupy_reconstruct",
+    "view_reconstruction_slice",
 ]

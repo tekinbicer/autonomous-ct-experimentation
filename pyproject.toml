@@ -13,6 +13,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dotenv = ["python-dotenv>=1.0.1"]
+web = [
+    "chainlit>=2.0.0",
+    "numpy>=1.26",
+    "tifffile>=2024.1.30",
+    "pillow>=10.0",
+]
 
 [project.scripts]
 autonomous-ct = "autonomous_ct.cli:main"
