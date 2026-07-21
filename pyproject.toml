@@ -17,7 +17,7 @@ web = [
     "chainlit>=2.0.0",
     "numpy>=1.26",
     "tifffile>=2024.1.30",
-    "pillow>=10.0",
+    "pillow>=12.3.0",
 ]
 
 [project.scripts]
