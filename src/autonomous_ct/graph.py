@@ -45,7 +45,13 @@ def build_graph(
     system_message = SystemMessage(content=system_prompt)
 
     def agent_node(state: AgentState) -> dict:
-        response = chat.invoke([system_message] + state["messages"])
+        # Must stream: the Argo gateway rejects non-streaming requests that may
+        # exceed its 10-minute limit with a 500 "Streaming is required" error.
+        response = None
+        for chunk in chat.stream([system_message] + state["messages"]):
+            response = chunk if response is None else response + chunk
+        if response is None:
+            response = chat.invoke([system_message] + state["messages"])
         return {"messages": [response]}
 
     builder = StateGraph(AgentState)
