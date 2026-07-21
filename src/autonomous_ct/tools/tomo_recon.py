@@ -1,7 +1,9 @@
 """Tomocupy-backed tomographic / laminographic reconstruction tools.
 
-These tools shell out to a containerized ``tomocupy`` build (default image
-``tomocupy:latest``) using the documented invocation:
+These tools shell out to ``tomocupy`` via one of two backends, selected at
+deploy time by the ``TOMOCUPY_BACKEND`` environment variable:
+
+* ``docker`` (default) -- containerized tomocupy build, e.g.::
 
     docker run --rm --gpus all \\
       -v "${INPUT_FOLDER}:/input" \\
@@ -14,16 +16,32 @@ These tools shell out to a containerized ``tomocupy`` build (default image
         --nsino-per-chunk <int> \\
         --out-path-name /output/<output-prefix>
 
-The Python wrappers below validate parameters, translate host paths to
-container paths, and (optionally) execute the command. They are exposed as
-LangChain ``@tool`` callables so the agent can invoke them directly.
+* ``native`` -- vanilla tomocupy executable on ``$PATH`` (override with
+  ``TOMOCUPY_BIN``)::
+
+    tomocupy recon \\
+        --file-name <abs-host-path-to-input> \\
+        --reconstruction-type <...> \\
+        --rotation-axis <...> \\
+        --nsino-per-chunk <...> \\
+        --out-path-name <abs-host-output-dir>/<output-prefix>
+
+The Python wrappers below validate parameters, (in docker mode) translate
+host paths to container paths, and (optionally) execute the command. They
+are exposed as LangChain ``@tool`` callables so the agent can invoke them
+directly. Docker-only tool parameters (``image``, ``use_gpus``,
+``run_as_current_user``, ``container_user``, ``container_env``) are
+silently ignored in native mode so the same agent prompt works against
+either backend.
 
 Path semantics
 --------------
 Host paths are made absolute via ``Path.absolute()`` but symlinks are NOT
-resolved. The user-named directory is what gets bind-mounted into the
-container; this avoids surprising the user when ``/input/scan.h5`` is a
-symlink to a deep beamline path that Docker may not be allowed to mount.
+resolved. In docker mode the user-named directory is what gets
+bind-mounted into the container; this avoids surprising the user when
+``/input/scan.h5`` is a symlink to a deep beamline path that Docker may
+not be allowed to mount. In native mode the same host path is passed
+straight to tomocupy.
 """
 
 from __future__ import annotations
@@ -47,8 +65,13 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 _FALLBACK_IMAGE = "tomocupy:latest"
 _FALLBACK_DOCKER_BIN = "docker"
+_FALLBACK_TOMOCUPY_BIN = "tomocupy"
+_FALLBACK_BACKEND = "docker"
 CONTAINER_INPUT_MOUNT = "/input"
 CONTAINER_OUTPUT_MOUNT = "/output"
+
+Backend = Literal["docker", "native"]
+_VALID_BACKENDS: tuple[Backend, ...] = ("docker", "native")
 
 # Subset of host env passed to the docker subprocess. Anything outside this set
 # is dropped to keep runs reproducible and avoid leaking secrets.
@@ -62,6 +85,24 @@ _SUBPROCESS_ENV_ALLOWLIST: tuple[str, ...] = (
     "XDG_RUNTIME_DIR",
 )
 
+# Subset of host env passed to the *native* tomocupy subprocess. Wider than the
+# docker allowlist because tomocupy runs in-process and needs the GPU/CUDA
+# runtime to be visible, plus any conda/venv prefix that activated tomocupy.
+# Still allowlisted (not full os.environ) to keep runs reproducible and avoid
+# leaking unrelated secrets.
+_NATIVE_SUBPROCESS_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "LD_LIBRARY_PATH",
+    "CUDA_VISIBLE_DEVICES",
+    "CUDA_HOME",
+    "CUDA_PATH",
+    "CONDA_PREFIX",
+    "CONDA_DEFAULT_ENV",
+    "VIRTUAL_ENV",
+    "XDG_RUNTIME_DIR",
+)
+
 
 def default_image() -> str:
     """Tomocupy Docker image tag, env-overridable via ``TOMOCUPY_IMAGE``."""
@@ -71,6 +112,32 @@ def default_image() -> str:
 def default_docker_bin() -> str:
     """Docker CLI binary, env-overridable via ``TOMOCUPY_DOCKER_BIN``."""
     return os.environ.get("TOMOCUPY_DOCKER_BIN", _FALLBACK_DOCKER_BIN)
+
+
+def default_tomocupy_bin() -> str:
+    """Native tomocupy binary, env-overridable via ``TOMOCUPY_BIN``.
+
+    Used only when the active backend is ``native``. Default is the bare
+    name ``tomocupy``; pass an absolute path here (e.g.
+    ``/opt/conda/envs/tomocupy/bin/tomocupy``) when the binary isn't on
+    the calling shell's ``PATH``.
+    """
+    return os.environ.get("TOMOCUPY_BIN", _FALLBACK_TOMOCUPY_BIN)
+
+
+def default_backend() -> Backend:
+    """Active reconstruction backend, env-overridable via ``TOMOCUPY_BACKEND``.
+
+    Accepts ``"docker"`` (default) or ``"native"``, case-insensitive.
+    Raises ``ValueError`` if the env var is set to anything else so that
+    a typo fails loudly instead of silently falling back to docker.
+    """
+    raw = os.environ.get("TOMOCUPY_BACKEND", _FALLBACK_BACKEND).strip().lower()
+    if raw not in _VALID_BACKENDS:
+        raise ValueError(
+            f"TOMOCUPY_BACKEND={raw!r} is not a valid backend; expected one of {_VALID_BACKENDS}."
+        )
+    return raw  # type: ignore[return-value]
 
 
 def _current_user_spec() -> str | None:
@@ -109,9 +176,7 @@ VALID_RECON_TYPES: tuple[str, ...] = (
 
 # Reconstruction types that need a known rotation axis. ``try`` / ``try_lamino``
 # can search for it, so they may omit it.
-RECON_TYPES_REQUIRING_AXIS: frozenset[str] = frozenset(
-    {"full", "lamino", "lamino_full"}
-)
+RECON_TYPES_REQUIRING_AXIS: frozenset[str] = frozenset({"full", "lamino", "lamino_full"})
 
 # Flags the planner emits itself; ``extra_args`` may not duplicate or override
 # them.
@@ -166,18 +231,31 @@ class TomocupyInvocation:
     Attributes
     ----------
     command:
-        The full ``docker run`` argv list, suitable for ``subprocess.run``.
+        The full argv list, suitable for ``subprocess.run``. In docker mode
+        this starts with ``[<docker-bin>, "run", ...]``; in native mode it
+        starts with ``[<tomocupy-bin>, "recon", ...]``.
+    backend:
+        Which backend produced this invocation (``"docker"`` or ``"native"``).
     host_input_dir / host_output_dir:
-        Absolute host directories that will be bind-mounted into the container.
-    container_input_path / container_output_prefix:
-        The paths the container itself will see (``/input/...`` / ``/output/...``).
+        Absolute host directories. In docker mode these get bind-mounted into
+        the container; in native mode they're informational (tomocupy sees
+        host paths directly).
+    input_path:
+        Path tomocupy receives as ``--file-name``. In docker mode this is
+        the container-side path (``/input/<name>``); in native mode this is
+        the absolute host path.
+    output_prefix_path:
+        Path tomocupy receives as ``--out-path-name``. In docker mode this
+        is the container-side path (``/output/<prefix>``); in native mode
+        this is the absolute host path ``<host_output_dir>/<prefix>``.
     """
 
     command: list[str]
+    backend: Backend
     host_input_dir: Path
     host_output_dir: Path
-    container_input_path: str
-    container_output_prefix: str
+    input_path: str
+    output_prefix_path: str
     extra_args: tuple[str, ...] = field(default_factory=tuple)
 
     def shell_string(self) -> str:
@@ -200,14 +278,20 @@ def _validate_recon_type(value: str) -> str:
     return value
 
 
-def _validate_extra_args(extras: Sequence[str]) -> tuple[str, ...]:
+def _validate_extra_args(extras: Sequence[str], backend: Backend) -> tuple[str, ...]:
     for arg in extras:
         if arg in _CANONICAL_RECON_FLAGS:
             raise ValueError(
                 f"extra_args may not override canonical recon flag {arg!r}; "
                 "set it via the dedicated parameter instead."
             )
-        if any(arg == p or arg.startswith(p + "=") for p in _FORBIDDEN_EXTRA_PREFIXES):
+        # Docker-level flags only matter when we're emitting a docker argv;
+        # in native mode they're nonsense for ``tomocupy recon`` but it's not
+        # this tool's place to police arbitrary tomocupy flags. Relaxing the
+        # check here also lets the same agent prompt drive both backends.
+        if backend == "docker" and any(
+            arg == p or arg.startswith(p + "=") for p in _FORBIDDEN_EXTRA_PREFIXES
+        ):
             raise ValueError(
                 f"extra_args may not include docker-level flag {arg!r}; "
                 "those are managed by this tool."
@@ -215,34 +299,39 @@ def _validate_extra_args(extras: Sequence[str]) -> tuple[str, ...]:
     return tuple(extras)
 
 
-def _resolve_input(input_file: str | os.PathLike[str]) -> tuple[Path, Path, str]:
-    """Resolve the host input file and the container-side path.
+def _resolve_input(input_file: str | os.PathLike[str], backend: Backend) -> tuple[Path, Path, str]:
+    """Resolve the host input file and the tomocupy-visible path.
 
     Uses ``Path.absolute()`` (not ``Path.resolve()``) so that user-named
-    symlinks are preserved in the bind mount. The existence check still works
-    because ``Path.is_file()`` follows symlinks by default.
+    symlinks are preserved in the (docker) bind mount. The existence check
+    still works because ``Path.is_file()`` follows symlinks by default.
 
-    Returns ``(host_dir, host_file, container_path)`` where ``host_dir`` is the
-    directory bind-mounted into the container at ``/input``.
+    Returns ``(host_dir, host_file, tomocupy_path)`` where ``tomocupy_path``
+    is what gets passed as ``--file-name``: the container-side mount path in
+    docker mode, the absolute host path in native mode.
     """
     host_file = Path(input_file).expanduser().absolute()
     if not host_file.is_file():
         raise FileNotFoundError(f"Input file not found on host: {host_file}")
     host_dir = host_file.parent
-    container_path = f"{CONTAINER_INPUT_MOUNT}/{host_file.name}"
-    return host_dir, host_file, container_path
+    if backend == "docker":
+        tomocupy_path = f"{CONTAINER_INPUT_MOUNT}/{host_file.name}"
+    else:
+        tomocupy_path = str(host_file)
+    return host_dir, host_file, tomocupy_path
 
 
 def _resolve_output(
     output_dir: str | os.PathLike[str],
     output_prefix: str,
+    backend: Backend,
     create: bool = True,
 ) -> tuple[Path, str]:
-    """Resolve the host output directory and container-side output prefix.
+    """Resolve the host output directory and tomocupy-visible output prefix.
 
     ``output_prefix`` is treated as a *file/dir basename* relative to the host
     output directory. Absolute paths and ``..`` traversal are rejected to keep
-    the container path-mapping unambiguous.
+    the (docker) path-mapping unambiguous and the native path predictable.
     """
     if not output_prefix or output_prefix.strip() == "":
         raise ValueError("output_prefix must be a non-empty basename.")
@@ -258,8 +347,11 @@ def _resolve_output(
     elif not host_dir.is_dir():
         raise FileNotFoundError(f"Output directory does not exist: {host_dir}")
 
-    container_prefix = f"{CONTAINER_OUTPUT_MOUNT}/{output_prefix}"
-    return host_dir, container_prefix
+    if backend == "docker":
+        tomocupy_prefix = f"{CONTAINER_OUTPUT_MOUNT}/{output_prefix}"
+    else:
+        tomocupy_prefix = str(host_dir / output_prefix)
+    return host_dir, tomocupy_prefix
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +369,8 @@ def plan_tomocupy_command(
     nsino_per_chunk: int = 4,
     image: str | None = None,
     docker_bin: str | None = None,
+    tomocupy_bin: str | None = None,
+    backend: Backend | None = None,
     use_gpus: bool = True,
     extra_args: Sequence[str] | None = None,
     run_as_current_user: bool = True,
@@ -284,25 +378,41 @@ def plan_tomocupy_command(
     container_env: dict[str, str] | None = None,
     create_output_dir: bool = True,
 ) -> TomocupyInvocation:
-    """Validate inputs and assemble the ``docker run`` command for tomocupy.
+    """Validate inputs and assemble the tomocupy command for the active backend.
 
     This function performs no side effects beyond (optionally) creating the
     host output directory. It is the single source of truth for command
-    construction and is unit-tested without invoking Docker.
+    construction and is unit-tested without invoking Docker or tomocupy.
 
     Parameters
     ----------
+    backend:
+        ``"docker"`` (default behavior) or ``"native"``. When ``None``, falls
+        back to :func:`default_backend` (env var ``TOMOCUPY_BACKEND``).
+    tomocupy_bin:
+        Native tomocupy executable. Only consulted when ``backend == "native"``.
+        Defaults to :func:`default_tomocupy_bin` (``TOMOCUPY_BIN`` or
+        ``"tomocupy"``).
     run_as_current_user:
-        When True (default) and ``container_user`` is unset, the planner emits
-        ``--user <uid>:<gid>`` so output files are owned by the invoking POSIX
-        user instead of root. On non-POSIX hosts the flag is silently omitted.
+        Docker only. When True (default) and ``container_user`` is unset, the
+        planner emits ``--user <uid>:<gid>`` so output files are owned by the
+        invoking POSIX user instead of root. On non-POSIX hosts the flag is
+        silently omitted. Ignored when ``backend == "native"``.
     container_user:
-        Explicit ``--user`` value (e.g. ``"1000:1000"``). Wins over
-        ``run_as_current_user`` when provided. Must be non-empty.
+        Docker only. Explicit ``--user`` value (e.g. ``"1000:1000"``). Wins
+        over ``run_as_current_user`` when provided. Must be non-empty. Ignored
+        when ``backend == "native"``.
     container_env:
-        Extra environment variables to pass to the container with ``-e``.
-        Merged on top of the default ``{"HOME": "/tmp"}``; caller values win
-        per key.
+        Docker only. Extra environment variables to pass to the container with
+        ``-e``. Merged on top of the default ``{"HOME": "/tmp"}``; caller
+        values win per key. Ignored when ``backend == "native"``.
+    image:
+        Docker only. Image tag (defaults to :func:`default_image`). Ignored
+        when ``backend == "native"``.
+    use_gpus:
+        Docker only. Whether to emit ``--gpus all``. Ignored when
+        ``backend == "native"`` (native tomocupy uses whatever GPUs are
+        visible per ``CUDA_VISIBLE_DEVICES``).
     """
     _validate_recon_type(reconstruction_type)
     if nsino_per_chunk <= 0:
@@ -313,19 +423,84 @@ def plan_tomocupy_command(
             "Use reconstruction_type='try' (or 'try_lamino') to search for it first."
         )
 
-    extras = _validate_extra_args(tuple(extra_args or ()))
+    resolved_backend: Backend = backend if backend is not None else default_backend()
+    if resolved_backend not in _VALID_BACKENDS:
+        raise ValueError(
+            f"backend={resolved_backend!r} is not a valid backend; "
+            f"expected one of {_VALID_BACKENDS}."
+        )
 
-    host_input_dir, _host_file, container_input = _resolve_input(input_file)
-    host_output_dir, container_output_prefix = _resolve_output(
-        output_dir, output_prefix, create=create_output_dir
+    extras = _validate_extra_args(tuple(extra_args or ()), resolved_backend)
+
+    host_input_dir, _host_file, input_path = _resolve_input(input_file, resolved_backend)
+    host_output_dir, output_prefix_path = _resolve_output(
+        output_dir, output_prefix, resolved_backend, create=create_output_dir
     )
 
-    if host_output_dir == host_input_dir:
+    if resolved_backend == "docker" and host_output_dir == host_input_dir:
+        # Docker-only: bind mounts collide if /input and /output point at the
+        # same host directory. Native tomocupy doesn't care, so we don't check.
         raise ValueError(
             "output_dir must be a different host directory than the input file's "
             "parent; tomocupy expects distinct /input and /output mounts."
         )
 
+    if resolved_backend == "docker":
+        cmd = _build_docker_command(
+            host_input_dir=host_input_dir,
+            host_output_dir=host_output_dir,
+            input_path=input_path,
+            output_prefix_path=output_prefix_path,
+            reconstruction_type=reconstruction_type,
+            rotation_axis=rotation_axis,
+            nsino_per_chunk=nsino_per_chunk,
+            image=image,
+            docker_bin=docker_bin,
+            use_gpus=use_gpus,
+            run_as_current_user=run_as_current_user,
+            container_user=container_user,
+            container_env=container_env,
+            extras=extras,
+        )
+    else:
+        cmd = _build_native_command(
+            input_path=input_path,
+            output_prefix_path=output_prefix_path,
+            reconstruction_type=reconstruction_type,
+            rotation_axis=rotation_axis,
+            nsino_per_chunk=nsino_per_chunk,
+            tomocupy_bin=tomocupy_bin,
+            extras=extras,
+        )
+
+    return TomocupyInvocation(
+        command=cmd,
+        backend=resolved_backend,
+        host_input_dir=host_input_dir,
+        host_output_dir=host_output_dir,
+        input_path=input_path,
+        output_prefix_path=output_prefix_path,
+        extra_args=extras,
+    )
+
+
+def _build_docker_command(
+    *,
+    host_input_dir: Path,
+    host_output_dir: Path,
+    input_path: str,
+    output_prefix_path: str,
+    reconstruction_type: str,
+    rotation_axis: float | None,
+    nsino_per_chunk: int,
+    image: str | None,
+    docker_bin: str | None,
+    use_gpus: bool,
+    run_as_current_user: bool,
+    container_user: str | None,
+    container_env: dict[str, str] | None,
+    extras: tuple[str, ...],
+) -> list[str]:
     resolved_image = image or default_image()
     resolved_docker = docker_bin or default_docker_bin()
 
@@ -350,27 +525,49 @@ def plan_tomocupy_command(
         resolved_image,
         "recon",
         "--file-name",
-        container_input,
+        input_path,
         "--reconstruction-type",
         reconstruction_type,
         "--nsino-per-chunk",
         str(nsino_per_chunk),
         "--out-path-name",
-        container_output_prefix,
+        output_prefix_path,
     ]
     if rotation_axis is not None:
         cmd += ["--rotation-axis", str(rotation_axis)]
     if extras:
         cmd += list(extras)
+    return cmd
 
-    return TomocupyInvocation(
-        command=cmd,
-        host_input_dir=host_input_dir,
-        host_output_dir=host_output_dir,
-        container_input_path=container_input,
-        container_output_prefix=container_output_prefix,
-        extra_args=extras,
-    )
+
+def _build_native_command(
+    *,
+    input_path: str,
+    output_prefix_path: str,
+    reconstruction_type: str,
+    rotation_axis: float | None,
+    nsino_per_chunk: int,
+    tomocupy_bin: str | None,
+    extras: tuple[str, ...],
+) -> list[str]:
+    resolved_bin = tomocupy_bin or default_tomocupy_bin()
+    cmd: list[str] = [
+        resolved_bin,
+        "recon",
+        "--file-name",
+        input_path,
+        "--reconstruction-type",
+        reconstruction_type,
+        "--nsino-per-chunk",
+        str(nsino_per_chunk),
+        "--out-path-name",
+        output_prefix_path,
+    ]
+    if rotation_axis is not None:
+        cmd += ["--rotation-axis", str(rotation_axis)]
+    if extras:
+        cmd += list(extras)
+    return cmd
 
 
 def _truncate(text: str, limit: int = 4000) -> str:
@@ -380,9 +577,15 @@ def _truncate(text: str, limit: int = 4000) -> str:
     return text[:half] + f"\n... [truncated {len(text) - limit} chars] ...\n" + text[-half:]
 
 
-def _scoped_subprocess_env() -> dict[str, str]:
-    """Minimal environment passed to the docker subprocess."""
-    return {k: os.environ[k] for k in _SUBPROCESS_ENV_ALLOWLIST if k in os.environ}
+def _scoped_subprocess_env(backend: Backend) -> dict[str, str]:
+    """Minimal environment passed to the tomocupy/docker subprocess.
+
+    Docker mode uses a tight allowlist (PATH, HOME, DOCKER_*, XDG_RUNTIME_DIR);
+    native mode uses a wider CUDA-aware allowlist so tomocupy can see the GPU
+    runtime and any active conda/venv prefix.
+    """
+    allow = _NATIVE_SUBPROCESS_ENV_ALLOWLIST if backend == "native" else _SUBPROCESS_ENV_ALLOWLIST
+    return {k: os.environ[k] for k in allow if k in os.environ}
 
 
 # ---------------------------------------------------------------------------
@@ -426,30 +629,42 @@ class TomocupyToolParams(BaseModel):
         description="Sinograms per GPU chunk. Larger = more GPU memory.",
     )
     image: str | None = Field(
-        default=None, description="Override the tomocupy Docker image tag."
+        default=None,
+        description=(
+            "Override the tomocupy Docker image tag. Docker backend only; "
+            "silently ignored when TOMOCUPY_BACKEND=native."
+        ),
     )
     use_gpus: bool = Field(
-        default=True, description="If True, pass --gpus all to docker run."
+        default=True,
+        description=(
+            "If True, pass --gpus all to docker run. Docker backend only; "
+            "silently ignored when TOMOCUPY_BACKEND=native (native tomocupy "
+            "uses whatever GPUs CUDA_VISIBLE_DEVICES exposes)."
+        ),
     )
     extra_args: list[str] | None = Field(
         default=None,
         description=(
             "Additional tomocupy CLI flags (e.g. ['--lamino-angle', '18.5']). "
-            "May not include docker-level flags or duplicate canonical flags."
+            "May not duplicate canonical flags; in docker mode also may not "
+            "include docker-level flags (-v, --gpus, --user, -e, ...)."
         ),
     )
     run_as_current_user: bool = Field(
         default=True,
         description=(
             "If True (default, POSIX only), pass --user $(id -u):$(id -g) so "
-            "output files are owned by the invoking user instead of root."
+            "output files are owned by the invoking user instead of root. "
+            "Docker backend only; silently ignored when TOMOCUPY_BACKEND=native."
         ),
     )
     container_user: str | None = Field(
         default=None,
         description=(
             "Explicit --user value, e.g. '1000:1000'. Wins over "
-            "run_as_current_user. Leave unset to use the default."
+            "run_as_current_user. Leave unset to use the default. Docker "
+            "backend only; silently ignored when TOMOCUPY_BACKEND=native."
         ),
     )
     container_env: dict[str, str] | None = Field(
@@ -457,7 +672,8 @@ class TomocupyToolParams(BaseModel):
         description=(
             "Extra environment variables to pass to the container with -e. "
             "Merged on top of the default {'HOME': '/tmp'}; caller values win "
-            "per key."
+            "per key. Docker backend only; silently ignored when "
+            "TOMOCUPY_BACKEND=native."
         ),
     )
 
@@ -524,9 +740,16 @@ def tomocupy_reconstruct(
             text=True,
             timeout=timeout_seconds,
             check=False,
-            env=_scoped_subprocess_env(),
+            env=_scoped_subprocess_env(plan.backend),
         )
     except FileNotFoundError as exc:
+        if plan.backend == "native":
+            return (
+                f"TOMOCUPY_BIN_NOT_FOUND: {exc}. Ensure tomocupy is installed and "
+                "on PATH (or set TOMOCUPY_BIN to its absolute path); set "
+                "TOMOCUPY_BACKEND=docker to use the containerized backend instead. "
+                f"Planned command was: {plan.shell_string()}"
+            )
         return (
             f"DOCKER_NOT_FOUND: {exc}. Ensure the Docker CLI is installed and on PATH. "
             f"Planned command was: {plan.shell_string()}"
@@ -539,12 +762,13 @@ def tomocupy_reconstruct(
             f"Partial stderr:\n{_truncate(exc.stderr or '')}"
         )
 
-    status = "SUCCESS" if proc.returncode == 0 else f"FAILED (exit={proc.returncode})"
+    base = "SUCCESS" if proc.returncode == 0 else f"FAILED (exit={proc.returncode})"
+    status = f"{base} [backend={plan.backend}]"
     return (
         f"{status}\n"
         f"Command: {plan.shell_string()}\n"
         f"Host output dir: {plan.host_output_dir}\n"
-        f"Container output prefix: {plan.container_output_prefix}\n"
+        f"Output prefix path: {plan.output_prefix_path}\n"
         f"--- stdout (tail) ---\n{_truncate(proc.stdout or '')}\n"
         f"--- stderr (tail) ---\n{_truncate(proc.stderr or '')}"
     )
@@ -590,13 +814,26 @@ def tomocupy_dry_run(
     except (ValueError, FileNotFoundError) as exc:
         return f"VALIDATION_ERROR: {exc}"
 
+    if plan.backend == "docker":
+        path_lines = (
+            f"Host input dir (mounted to {CONTAINER_INPUT_MOUNT}): "
+            f"{plan.host_input_dir}\n"
+            f"Host output dir (mounted to {CONTAINER_OUTPUT_MOUNT}): "
+            f"{plan.host_output_dir}\n"
+            f"Container input file: {plan.input_path}\n"
+            f"Container output prefix: {plan.output_prefix_path}"
+        )
+    else:
+        path_lines = (
+            f"Host input dir: {plan.host_input_dir}\n"
+            f"Host output dir: {plan.host_output_dir}\n"
+            f"Input file (--file-name): {plan.input_path}\n"
+            f"Output prefix (--out-path-name): {plan.output_prefix_path}"
+        )
     return (
-        "DRY_RUN (command not executed)\n"
+        f"DRY_RUN [backend={plan.backend}] (command not executed)\n"
         f"Command: {plan.shell_string()}\n"
-        f"Host input dir (mounted to {CONTAINER_INPUT_MOUNT}): {plan.host_input_dir}\n"
-        f"Host output dir (mounted to {CONTAINER_OUTPUT_MOUNT}): {plan.host_output_dir}\n"
-        f"Container input file: {plan.container_input_path}\n"
-        f"Container output prefix: {plan.container_output_prefix}"
+        f"{path_lines}"
     )
 
 
@@ -641,9 +878,7 @@ def inspect_hdf5_dataset(input_file: str, max_entries: int = 40) -> str:
                 if count >= max_entries:
                     raise _StopVisit
                 if isinstance(obj, h5py.Dataset):
-                    lines.append(
-                        f"  dataset: /{name}  shape={obj.shape}  dtype={obj.dtype}"
-                    )
+                    lines.append(f"  dataset: /{name}  shape={obj.shape}  dtype={obj.dtype}")
                 elif isinstance(obj, h5py.Group):
                     lines.append(f"  group:   /{name}")
                 count += 1
@@ -688,9 +923,7 @@ def _parse_h5_path(spec: str) -> tuple[str, str | None]:
         h5_path, attr = spec.split("@", 1)
         attr = attr.strip()
         if not attr:
-            raise ValueError(
-                f"path spec {spec!r} has empty attribute name after '@'."
-            )
+            raise ValueError(f"path spec {spec!r} has empty attribute name after '@'.")
         return (h5_path or "/", attr)
     return (spec, None)
 
@@ -730,10 +963,7 @@ def _format_array_value(value: object, max_inline: int) -> str:
             tail = list(value[-tail_n:])  # type: ignore[index]
         except (TypeError, IndexError):
             head, tail = [], []
-        summary = (
-            f"shape={shape} dtype={dtype} "
-            f"first{head_n}={head!r} last{tail_n}={tail!r}"
-        )
+        summary = f"shape={shape} dtype={dtype} first{head_n}={head!r} last{tail_n}={tail!r}"
         if getattr(dtype, "kind", None) in _NUMERIC_DTYPE_KINDS:
             with contextlib.suppress(ValueError, TypeError):
                 summary += f" min={value.min()} max={value.max()}"  # type: ignore[union-attr]
@@ -761,10 +991,7 @@ def _render_dataset(dataset: object, max_inline: int) -> str:
         tail_n = min(_PREVIEW_HEAD_TAIL, length)
         head = list(dataset[:head_n])  # type: ignore[index]
         tail = list(dataset[-tail_n:]) if tail_n else []  # type: ignore[index]
-        rendered = (
-            f"shape={shape} dtype={dtype} "
-            f"first{head_n}={head!r} last{tail_n}={tail!r}"
-        )
+        rendered = f"shape={shape} dtype={dtype} first{head_n}={head!r} last{tail_n}={tail!r}"
         is_numeric = getattr(dtype, "kind", None) in _NUMERIC_DTYPE_KINDS
         within_minmax_budget = length <= _MIN_MAX_MAX_LENGTH_RATIO * max_inline
         if is_numeric and within_minmax_budget:
@@ -872,13 +1099,10 @@ def read_hdf5_values(
                     if attr is not None:
                         if attr not in obj.attrs:
                             lines.append(
-                                f"  {spec} -> ATTR_MISSING: no attribute "
-                                f"{attr!r} on {obj_path!r}"
+                                f"  {spec} -> ATTR_MISSING: no attribute {attr!r} on {obj_path!r}"
                             )
                             continue
-                        rendered = _format_array_value(
-                            obj.attrs[attr], max_inline_elements
-                        )
+                        rendered = _format_array_value(obj.attrs[attr], max_inline_elements)
                         lines.append(f"  {spec} = {rendered}")
                         continue
 
@@ -897,3 +1121,192 @@ def read_hdf5_values(
         return f"H5_READ_ERROR: {exc}"
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Reconstruction slice viewer
+# ---------------------------------------------------------------------------
+
+# Marker line emitted by view_reconstruction_slice. The web UI greps tool
+# output for this prefix to attach the rendered PNG as an inline image; the
+# CLI just shows the path. Keeping the contract a plain text marker means the
+# tool stays a pure string-returning @tool that works in both frontends.
+SLICE_PNG_MARKER = "SLICE_PNG:"
+
+# Where rendered slice PNGs are written. A dedicated subdir of the system temp
+# dir keeps them off the reconstruction output volume and easy to clean up.
+_SLICE_PNG_SUBDIR = "autonomous_ct_slices"
+
+_VALID_VIEW_AXES: tuple[str, ...] = ("xy", "xz", "yz")
+
+
+class ViewSliceParams(BaseModel):
+    """Parameters for :func:`view_reconstruction_slice`."""
+
+    output_path: str = Field(
+        ...,
+        description=(
+            "Path to the reconstruction output. Either the tomocupy "
+            "--out-path-name prefix, the directory of recon_*.tiff files, or "
+            "the <prefix>.h5 volume file."
+        ),
+    )
+    axis: Literal["xy", "xz", "yz"] = Field(
+        default="xy",
+        description=(
+            "Orthogonal viewing plane: 'xy' axial (default), 'xz' coronal, "
+            "'yz' sagittal."
+        ),
+    )
+    index: int | None = Field(
+        default=None,
+        description=(
+            "Slice index along the chosen axis. Omit to use the middle slice."
+        ),
+    )
+    low_percentile: float = Field(
+        default=1.0,
+        description="Lower percentile for contrast windowing (default 1.0).",
+    )
+    high_percentile: float = Field(
+        default=99.0,
+        description="Upper percentile for contrast windowing (default 99.0).",
+    )
+    row_start: int | None = Field(
+        default=None,
+        description=(
+            "Zoom: top edge (inclusive) of the region of interest, in slice "
+            "pixel rows. Omit for the slice's top edge. The slice is "
+            "(rows x cols) = (height x width)."
+        ),
+    )
+    row_end: int | None = Field(
+        default=None,
+        description="Zoom: bottom edge (exclusive) of the ROI in rows. Omit for the bottom edge.",
+    )
+    col_start: int | None = Field(
+        default=None,
+        description="Zoom: left edge (inclusive) of the ROI in columns. Omit for the left edge.",
+    )
+    col_end: int | None = Field(
+        default=None,
+        description="Zoom: right edge (exclusive) of the ROI in columns. Omit for the right edge.",
+    )
+    zoom: float = Field(
+        default=1.0,
+        description=(
+            "Magnification applied to the cropped ROI (e.g. 4.0 = 4x larger). "
+            "1.0 = crop only, no upscaling. Combine with row/col bounds to "
+            "zoom into a feature."
+        ),
+    )
+    interpolation: Literal["nearest", "bilinear"] = Field(
+        default="nearest",
+        description=(
+            "Upscaling interpolation. 'nearest' (default) preserves exact "
+            "reconstructed pixel values as sharp blocks (best for quantitative "
+            "inspection); 'bilinear' smooths but invents intermediate values."
+        ),
+    )
+
+
+@tool(args_schema=ViewSliceParams)
+def view_reconstruction_slice(
+    output_path: str,
+    axis: Literal["xy", "xz", "yz"] = "xy",
+    index: int | None = None,
+    low_percentile: float = 1.0,
+    high_percentile: float = 99.0,
+    row_start: int | None = None,
+    row_end: int | None = None,
+    col_start: int | None = None,
+    col_end: int | None = None,
+    zoom: float = 1.0,
+    interpolation: Literal["nearest", "bilinear"] = "nearest",
+) -> str:
+    """Render one slice of a reconstructed volume as a viewable PNG image.
+
+    Locates the volume produced at ``output_path`` (a directory of
+    ``recon_*.tiff`` files or a ``<prefix>.h5`` HDF5 volume), extracts the
+    requested orthogonal slice, optionally crops to a region of interest and
+    magnifies it, applies percentile contrast windowing, and writes an 8-bit
+    PNG to a temp file. The returned text reports the volume shape, the chosen
+    slice, the zoom region, and a ``SLICE_PNG: <path>`` marker line that the
+    web UI uses to display the image inline.
+
+    Use this after a reconstruction completes to let the user inspect the
+    result. ``axis='xy'`` (axial) with the middle slice is the usual first
+    look; ``'xz'``/``'yz'`` reslice the volume for orthogonal views.
+
+    Zooming: pass any of ``row_start``/``row_end``/``col_start``/``col_end``
+    to crop to a region (in slice pixel coordinates), and/or ``zoom`` to
+    magnify it (e.g. ``zoom=4.0``). Contrast is windowed to the zoomed
+    region's own values so faint detail in a small ROI stays visible.
+    """
+    import tempfile
+
+    try:
+        from ..slices import (
+            crop_and_zoom,
+            discover_volume,
+            middle_index,
+            normalize_to_png,
+            read_slice,
+        )
+    except ImportError as exc:
+        return (
+            "SLICE_DEPS_MISSING: slice viewing needs the 'web' extra "
+            f"(numpy, tifffile, pillow). Install with `uv sync --extra web`. ({exc})"
+        )
+
+    if axis not in _VALID_VIEW_AXES:
+        return f"VALIDATION_ERROR: axis must be one of {_VALID_VIEW_AXES}, got {axis!r}."
+
+    try:
+        info = discover_volume(output_path)
+    except (FileNotFoundError, ValueError) as exc:
+        return f"VALIDATION_ERROR: {exc}"
+    except ImportError as exc:
+        return f"SLICE_DEPS_MISSING: {exc}"
+
+    resolved_index = middle_index(info, axis) if index is None else index
+    try:
+        slice_2d = read_slice(info, axis, resolved_index)
+    except (IndexError, ValueError) as exc:
+        return f"VALIDATION_ERROR: {exc}"
+
+    try:
+        zoom_result = crop_and_zoom(
+            slice_2d,
+            row_start=row_start,
+            row_end=row_end,
+            col_start=col_start,
+            col_end=col_end,
+            zoom=zoom,
+            interpolation=interpolation,
+        )
+        png = normalize_to_png(
+            zoom_result.array, percentile_clip=(low_percentile, high_percentile)
+        )
+    except ValueError as exc:
+        return f"VALIDATION_ERROR: {exc}"
+
+    out_dir = Path(tempfile.gettempdir()) / _SLICE_PNG_SUBDIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    png_path = out_dir / f"slice_{axis}_{resolved_index:05}.png"
+    png_path.write_bytes(png)
+
+    nz, ny, nx = info.shape
+    out_h, out_w = zoom_result.array.shape
+    return (
+        f"SLICE_RENDERED [kind={info.kind}]\n"
+        f"Volume: {info.path} shape=(nz={nz}, ny={ny}, nx={nx}) dtype={info.dtype}\n"
+        f"View: axis={axis} index={resolved_index} "
+        f"(of {info.axis_length(axis)} along this axis)\n"
+        f"Region: rows[{zoom_result.row_start}:{zoom_result.row_end}] "
+        f"cols[{zoom_result.col_start}:{zoom_result.col_end}] "
+        f"zoom={zoom_result.zoom}x ({zoom_result.interpolation}) "
+        f"-> {out_w}x{out_h} px\n"
+        f"Contrast: {low_percentile}-{high_percentile} percentile windowing\n"
+        f"{SLICE_PNG_MARKER} {png_path}"
+    )

@@ -12,8 +12,13 @@ end-to-end smoke testing.
 - Python >= 3.12
 - [`uv`](https://docs.astral.sh/uv/) for dependency management
 - Access to the Argo LLM gateway (ANL-internal)
-- For real reconstructions: Docker with NVIDIA Container Toolkit and a
-  built `tomocupy` image (default tag: `tomocupy:latest`)
+- For real reconstructions, one of:
+  - **Docker** with NVIDIA Container Toolkit and a built `tomocupy` image
+    (default tag: `tomocupy:latest`) — used when `TOMOCUPY_BACKEND=docker`
+    (the default)
+  - **Vanilla `tomocupy`** installed on the host (conda, pip, etc.) and
+    accessible on `$PATH` (or via `TOMOCUPY_BIN`) — used when
+    `TOMOCUPY_BACKEND=native`
 
 ## Setup
 
@@ -107,9 +112,95 @@ the final assistant reply — useful when piping output to another command:
 uv run autonomous-ct --quiet "Show me the dry-run command for /data/scan_001.h5" | tee plan.txt
 ```
 
+## Web UI (Chainlit)
+
+A browser chat interface is available via [Chainlit](https://chainlit.io).
+It runs the *same* computational imaging agent as the CLI and renders every
+tool call and tool result as a collapsible step — the browser equivalent of
+the CLI's live `-> tool:` / `<- tool:` reasoning view.
+
+Install the optional `web` extra and launch:
+
+```bash
+uv sync --extra web
+uv run chainlit run web_app.py -w
+```
+
+`web_app.py` is a thin top-level launcher; the app logic lives in
+`src/autonomous_ct/webui.py`. (Chainlit loads its target as a standalone
+module, so the package module is imported through the launcher rather than
+pointed at directly.)
+
+This serves the UI on <http://localhost:8000> (`-w` enables auto-reload on
+code changes). The agent needs the same `ARGO_*` environment variables as the
+CLI (see [Configuration](#configuration)); if they're missing, the UI shows a
+configuration error in the chat instead of crashing.
+
+Conversational memory works the same way as `--conversation`: each browser
+chat session gets a fresh `thread_id` backed by the LangGraph
+`SqliteSaver` checkpointer (stored in `./.autonomous_ct_threads.sqlite`), so
+multi-turn context is preserved within a session.
+
+> The pure message-rendering helpers in `webui.py` are unit-tested
+> (`tests/test_webui.py`) and do **not** require Chainlit to be installed;
+> only launching the server does.
+
+### Viewing reconstructed volume slices
+
+The imaging agent can render slices of a finished reconstruction directly in
+the chat. Just ask, e.g.:
+
+- *"Show me the middle slice of /data/data_rec/scan_001_rec."*
+- *"Display the coronal (xz) view at slice 200."*
+
+Under the hood the agent calls the `view_reconstruction_slice` tool, which:
+
+1. Locates the volume at the given path — both tomocupy output layouts are
+   supported: a directory of `recon_*.tiff` files, or a `<prefix>.h5` volume
+   with `/exchange/data` (the tomocupy default `--save-format`).
+2. Extracts the requested orthogonal slice:
+   - `xy` — axial (default)
+   - `xz` — coronal
+   - `yz` — sagittal
+
+   Omit the index to get the middle slice.
+3. Optionally **zooms** into a region of interest (see below).
+4. Applies percentile contrast windowing (1st–99th by default) so the raw
+   float/16-bit reconstruction data is actually visible, and encodes an 8-bit
+   grayscale PNG.
+
+The PNG is displayed inline in the Chainlit chat. (Slice rendering is part of
+the `web` extra; `numpy`, `tifffile`, and `pillow` are installed alongside
+Chainlit.)
+
+#### Zooming into a region
+
+Ask the agent to magnify a feature, e.g.:
+
+- *"Zoom into the center of that slice at 4x."*
+- *"Show rows 400–600, columns 300–500 magnified 8x."*
+
+The `view_reconstruction_slice` tool accepts a region of interest in slice
+pixel coordinates (`row_start`/`row_end` = image height, `col_start`/`col_end`
+= image width; any omitted bound defaults to the slice edge) plus a `zoom`
+magnification factor. Important details:
+
+- **Crop happens before contrast windowing**, so the contrast adapts to the
+  zoomed region's own value range — faint detail in a small ROI stays visible
+  instead of being washed out by the whole slice's range.
+- **Interpolation** defaults to `nearest`, which preserves the exact
+  reconstructed pixel values as sharp blocks (the scientifically honest choice
+  for quantitative CT inspection). Pass `interpolation="bilinear"` for a
+  smoother look at the cost of interpolated (invented) values.
+- Zoom is capped (factor ≤ 32 and a total output-pixel limit) to guard against
+  runaway upscales.
+
+The tool reports the resolved region and output dimensions back to the chat
+(e.g. `Region: rows[400:600] cols[300:500] zoom=8.0x (nearest) -> 1600x1600 px`).
+
 ## Computational imaging agent
 
-The imaging agent exposes four tools:
+The imaging agent exposes five tools:
 
 - **`tomocupy_dry_run`** — build the exact `docker run` command without
   executing it. The agent prefers this whenever the user has not explicitly
@@ -131,6 +222,14 @@ The imaging agent exposes four tools:
   returned as shape/dtype only so they cannot flood the conversation.
   Intended for extracting reconstruction parameters discovered via
   `inspect_hdf5_dataset` before planning a run.
+- **`view_reconstruction_slice`** — render one orthogonal slice of a finished
+  reconstruction (TIFF stack or `<prefix>.h5` volume) as a contrast-windowed
+  8-bit PNG. Supports `xy`/`xz`/`yz` views, a chosen or middle slice index,
+  and **region-of-interest zooming** (crop bounds + magnification factor +
+  nearest/bilinear interpolation). In the Chainlit web UI the PNG is shown
+  inline; see
+  [Viewing reconstructed volume slices](#viewing-reconstructed-volume-slices).
+  (Requires the `web` extra: `numpy`, `tifffile`, `pillow`.)
 
 Supported `reconstruction_type` values: `full`, `try`, `try_lamino`,
 `lamino`, `lamino_full`. Laminography-specific flags such as
@@ -163,6 +262,45 @@ docker run --rm --gpus all \
     --out-path-name /output/${OUTPUT_PREFIX}
 ```
 
+### Native (non-Docker) backend
+
+If you already have a vanilla `tomocupy` installation on the host (conda,
+pip, etc.), you can bypass Docker entirely by setting:
+
+```bash
+export TOMOCUPY_BACKEND=native
+# optional: absolute path to the tomocupy binary if it isn't on PATH
+export TOMOCUPY_BIN=/opt/conda/envs/tomocupy/bin/tomocupy
+```
+
+In native mode the imaging tools build and run:
+
+```bash
+tomocupy recon \
+  --file-name ${ABSOLUTE_HOST_INPUT_FILE} \
+  --reconstruction-type ${RECON_TYPE} \
+  --rotation-axis ${ROTATION_AXIS} \
+  --nsino-per-chunk ${NSIN_PER_CHUNK} \
+  --out-path-name ${ABSOLUTE_HOST_OUTPUT_DIR}/${OUTPUT_PREFIX}
+```
+
+No bind mounts, no `--gpus`/`--user`/`-e` flags, no image tag — host paths
+are passed through unchanged. Docker-only tool parameters (`image`,
+`use_gpus`, `run_as_current_user`, `container_user`, `container_env`) are
+silently ignored in native mode, so the same agent prompt works against
+either backend.
+
+The native subprocess inherits a CUDA-aware environment allowlist
+(`PATH`, `HOME`, `LD_LIBRARY_PATH`, `CUDA_VISIBLE_DEVICES`, `CUDA_HOME`,
+`CUDA_PATH`, `CONDA_PREFIX`, `CONDA_DEFAULT_ENV`, `VIRTUAL_ENV`,
+`XDG_RUNTIME_DIR`) so tomocupy can see the GPU runtime and any active
+conda/venv prefix. Other host environment variables (including secrets
+like `ARGO_API_KEY`) are stripped before exec.
+
+Tool output banners are tagged with the active backend
+(`SUCCESS [backend=native]` / `DRY_RUN [backend=docker]`) so you can
+verify at a glance which path ran.
+
 ## Project layout
 
 ```
@@ -173,6 +311,8 @@ src/autonomous_ct/
   graph.py               # AgentState + build_graph() (domain-neutral single-agent compiler)
   computation_graph.py   # build_computation_graph(agents=[...]) — multi-agent assembly
   cli.py                 # `autonomous-ct` entry point (--agent)
+  webui.py               # Chainlit web UI app logic (launched via top-level web_app.py)
+  slices.py              # reconstruction volume discovery + slice -> PNG rendering
   agents/
     __init__.py
     base.py              # Agent dataclass (name, system_prompt, tools)
@@ -181,7 +321,8 @@ src/autonomous_ct/
   tools/
     __init__.py
     weather.py           # legacy demo tool
-    tomo_recon.py        # tomocupy_reconstruct / _dry_run / inspect_hdf5_dataset
+    tomo_recon.py        # tomocupy_reconstruct / _dry_run / inspect_hdf5_dataset / view_reconstruction_slice
+web_app.py               # top-level Chainlit launcher (chainlit run web_app.py)
 tests/                   # pytest suite (no Docker required)
 scripts/demo.py          # interactive weather demo
 ```
@@ -207,5 +348,7 @@ All runtime configuration is sourced from environment variables (see
 | `ARGO_HOST_HEADER`      | no       | Optional explicit `Host` header override                   |
 | `ARGO_TIMEOUT_SECONDS`  | no       | HTTP timeout for Argo calls (default `60`)                 |
 | `ARGO_MAX_RETRIES`      | no       | Retry budget for Argo calls (default `2`)                  |
-| `TOMOCUPY_IMAGE`        | no       | Docker image tag (default `tomocupy:latest`)               |
-| `TOMOCUPY_DOCKER_BIN`   | no       | Docker CLI binary (default `docker`)                       |
+| `TOMOCUPY_BACKEND`      | no       | `docker` (default) or `native`; selects reconstruction backend |
+| `TOMOCUPY_IMAGE`        | no       | Docker image tag (default `tomocupy:latest`); docker backend only |
+| `TOMOCUPY_DOCKER_BIN`   | no       | Docker CLI binary (default `docker`); docker backend only  |
+| `TOMOCUPY_BIN`          | no       | Native tomocupy binary (default `tomocupy`); native backend only |
